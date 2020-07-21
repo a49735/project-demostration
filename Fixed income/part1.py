@@ -91,12 +91,8 @@ def DF_to_rate(df,x,n,gap,delta=0.5):
     rate0.extend(rate)
     return rate0
 
-
-
 LiborDF=[]
 LiborDF.append(1/(1+0.5*IRSR[0]))
-
-
 
 for i in range(1,len(Tenor)):
     j=Tenor[i]
