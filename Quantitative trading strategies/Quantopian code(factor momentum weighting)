@@ -345,14 +345,6 @@ def make_factors(universe):
 # (Yesterday's close - 52 week high) / 52 week high
     week52 = (yesterday_close - high) / high
     
-
-    
-    # def Earnings_Quality():
-    #     return cfs.operating_cash_flow.latest / \
-    #            EarningsSurprises.eps_act.latest
-    # def Earnings_Quality2():
-    #     return cfs.operating_cash_flow.latest / \
-    #            er.basic_eps.latest
 # #  F_score
 
 # profitbility
@@ -408,7 +400,6 @@ def make_factors(universe):
                    'Volatility': Vol_1M(),\
                    # 'Downside_Risk':Downside_Risk(),\
                    'Asset_anomalies':asset_anomalies(),\
-                   # 'Earnings Quality':Earnings_Quality2(),\
                    'Debt_to_asset':Debt_to_asset(),\
                    # 'Sales_Growth_12M':Sales_Growth_12M(),\
                    # 'Dividend_Growth':Dividend_Growth(),\
@@ -552,7 +543,6 @@ def initialize(context):
     algo.attach_pipeline(make_pipeline(), 'pipeline')
     algo.attach_pipeline(make_pipeline_small(), 'pipeline_small')
     algo.attach_pipeline(make_pipeline_big(), 'pipeline_big')
-    # algo.attach_pipeline(make_pipeline_combined(), 'pipeline3')
     
     #Schedule Functions
     schedule_function(trade, date_rules.week_start() , time_rules.market_open(minutes=10))
