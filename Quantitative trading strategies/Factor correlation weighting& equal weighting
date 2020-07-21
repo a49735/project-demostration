@@ -1,0 +1,626 @@
+import quantopian.algorithm as algo
+import quantopian.optimize as opt
+import numpy as np
+import pandas as pd
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.factors import CustomFactor, Returns,AverageDollarVolume,RollingLinearRegressionOfReturns
+from quantopian.pipeline.classifiers.fundamentals import Sector  
+from quantopian.pipeline.filters import QTradableStocksUS, Q500US
+from quantopian.pipeline.data import morningstar
+from quantopian.pipeline.data.zacks import EarningsSurprises
+from quantopian.pipeline.factors.morningstar import MarketCap
+from quantopian.pipeline.data.factset.estimates import PeriodicConsensus
+from quantopian.pipeline.data import Fundamentals
+from quantopian.pipeline.data import factset
+from sklearn.metrics.pairwise import cosine_similarity
+# from quantopian.pipeline.data.psychsignal import stocktwits
+from zipline.utils.numpy_utils import (
+    repeat_first_axis,
+    repeat_last_axis,
+)
+from scipy import stats
+# import talib
+
+bs = morningstar.balance_sheet
+cfs = morningstar.cash_flow_statement
+is_ = morningstar.income_statement
+or_ = morningstar.operation_ratios
+er = morningstar.earnings_report
+v = morningstar.valuation
+vr = morningstar.valuation_ratios
+
+UNIVERSE_SIZE = 1500
+MIN_MARKET_CAP_PERCENTILE = 0
+MAX_MARKET_CAP_PERCENTILE = 100
+LIQUIDITY_LOOKBACK_LENGTH = 100
+POSITION_SIZE = 0.05
+# Scheduling Parameters
+MINUTES_AFTER_OPEN_TO_TRADE = 10
+BASE_UNIVERSE_RECALCULATE_FREQUENCY = 'month_start'
+MAX_BETA_EXPOSURE = 0.1
+
+
+
+def filter_value(x):
+    if x > 0:
+        x =1
+    else:
+        x = 0
+    return x
+
+
+
+class Previous(CustomFactor):  
+    # Returns value of input x trading days ago where x is the window_length  
+    # Both the inputs and window_length must be specified as there are no defaults
+
+    def compute(self, today, assets, out, inputs):  
+        out[:] = inputs[0]
+
+
+def make_factors(universe):
+    
+    class Altman_Z(CustomFactor):
+        inputs=[factset.Fundamentals.zscore_qf]
+        window_length = 1
+        window_safe = True
+        def compute(self, today, assets, out, zscore_qf):
+            out[:] = (zscore_qf[-1])
+                
+    class Quick_Ratio(CustomFactor):
+        inputs=[factset.Fundamentals.quick_ratio_qf]
+        window_length = 1
+        window_safe = True
+        def compute(self, today, assets, out, quick_ratio_qf):
+            out[:] = (quick_ratio_qf[-1])
+            
+    class MaxGap(CustomFactor): 
+        # the biggest absolute overnight gap in the previous 90 sessions
+        inputs = [USEquityPricing.close] ; window_length = 90
+        window_safe = True
+        def compute(self, today, assets, out, close):
+            abs_log_rets = np.abs(np.diff(np.log(close),axis=0))
+            max_gap = np.max(abs_log_rets, axis=0)
+            out[:] = (max_gap)
+    
+    class SalesGrowth(CustomFactor):
+        inputs = [factset.Fundamentals.sales_gr_qf]
+        window_length = 252
+        window_safe = True
+        def compute(self, today, assets, out, sales_growth):
+            sales_growth = np.nan_to_num(sales_growth)
+            # sales_growth = preprocessing.scale(sales_growth,axis=0)
+            out[:] = (sales_growth[-1])
+            
+    def Sales_Growth_12M():
+        return Returns(inputs=[is_.total_revenue], window_length=252)
+ 
+    class GrossMarginChange(CustomFactor):
+        window_length = 252
+        window_safe = True
+        inputs = [factset.Fundamentals.ebit_oper_mgn_qf]
+        def compute(self, today, assets, out, ebit_oper_mgn):
+            ebit_oper_mgn = np.nan_to_num(ebit_oper_mgn)
+            # ebit_oper_mgn = preprocessing.scale(ebit_oper_mgn,axis=0)
+            out[:] = (ebit_oper_mgn[-1])
+            
+            
+    class Trendline(CustomFactor):
+        inputs = [USEquityPricing.close]
+        window_length = 252
+        window_safe = True
+            
+        _x = np.arange(window_length)
+        _x_var = np.var(_x)
+ 
+        def compute(self, today, assets, out, close):
+            
+            x_matrix = repeat_last_axis(
+            (self.window_length - 1) / 2 - self._x,
+            len(assets),
+            )
+ 
+            y_bar = np.nanmean(close, axis=0)
+            y_bars = repeat_first_axis(y_bar, self.window_length)
+            y_matrix = close - y_bars
+ 
+            out[:] = (-np.divide(
+            (x_matrix * y_matrix).sum(axis=0) / self._x_var,
+            self.window_length
+            ))
+    
+    class MoneyflowVolume5d(CustomFactor):
+        inputs = (USEquityPricing.close, USEquityPricing.volume)
+ 
+        # we need one more day to get the direction of the price on the first
+        # day of our desired window of 5 days
+        window_length = 6
+        window_safe = True
+            
+        def compute(self, today, assets, out, close_extra, volume_extra):
+            # slice off the extra row used to get the direction of the close
+            # on the first day
+            close = close_extra[1:]
+            volume = volume_extra[1:]
+                
+            dollar_volume = close * volume
+            denominator = dollar_volume.sum(axis=0)
+                
+            difference = np.diff(close_extra, axis=0)
+            direction = np.where(difference > 0, 1, -1)
+            numerator = (direction * dollar_volume).sum(axis=0)
+                
+            out[:] = (-np.divide(numerator, denominator))
+    
+    class growthscore(CustomFactor):
+        inputs = [Fundamentals.growth_score]
+        window_length = 1
+        window_safe = True
+        def compute(self, today, assets, out, growth_score):
+            out[:] = (growth_score[-1,:])
+                
+    class peg_ratio(CustomFactor):
+        inputs = [Fundamentals.peg_ratio]
+        window_length = 1
+        window_safe = True
+        def compute(self, today, assets, out, peg_ratio):
+            out[:] = (-1.0/peg_ratio[-1,:])
+    
+    class Direction(CustomFactor):
+        inputs = [USEquityPricing.open, USEquityPricing.close]
+        window_length = 21
+        window_safe = True
+        def compute(self, today, assets, out, open, close):
+            p = (close-open)/close
+            out[:] = (np.nansum(-p,axis=0))
+                
+#  safety   
+    def Debt_to_asset():
+        return -or_.debtto_assets.latest
+    
+    class Capx_vol(CustomFactor):
+        inputs=[factset.Fundamentals.capex_qf_asof_date,
+                factset.Fundamentals.capex_qf,
+                factset.Fundamentals.assets]
+        window_length = 390
+        def compute(self, today, assets, out, asof_date, capex, total_assets):
+            values = capex/total_assets
+            for column_ix in range(asof_date.shape[1]):
+                _, unique_indices = np.unique(asof_date[:, column_ix], return_index=True)
+                quarterly_values = values[unique_indices, column_ix]
+                if len(quarterly_values) < 6:
+                    quarterly_values = np.hstack([
+                    np.repeat([np.nan], 6 - len(quarterly_values)),
+                    quarterly_values,
+                ])
+                out[column_ix] = -np.std(quarterly_values[-6:])
+                
+    def Working_Capital_To_Sales():
+       
+        return -bs.working_capital.latest / is_.total_revenue.latest
+     
+    class Asset_Turnover(CustomFactor):
+        inputs = [is_.total_revenue, bs.total_assets]
+        window_length = 252
+
+        def compute(self, today, assets, out, sales, tot_assets):
+            out[:] = (sales[-1] * 4.) / \
+                ((tot_assets[-1] + tot_assets[0]) / 2.)
+#  asset annomalies
+    def asset_anomalies():
+        class capx_5y(CustomFactor):
+            inputs = [factset.Fundamentals.capex_5ygr_af]
+            window_length = 252
+            def compute(self, today, assets, out, inputs):  
+                out[:] = inputs[0]
+        ar = Returns(inputs=[bs.total_assets], window_length=252)
+        netf =  cfs.financing_cash_flow.latest
+        return -(ar.zscore(mask=universe)
+    +netf.zscore(mask=universe)+capx_5y().zscore(mask=universe))
+
+    
+    
+    def Cashflows_To_Assets():
+        return vr.cfo_per_share.latest / \
+            (bs.total_assets.latest / v.shares_outstanding.latest)
+    
+    
+    
+    class Downside_Risk(CustomFactor):
+        
+        inputs = [Returns(window_length=2)]
+        window_length = 252
+
+        def compute(self, today, assets, out, rets):
+            down_rets = np.where(rets < 0, rets, np.nan)
+            out[:] = -np.nanstd(down_rets, axis=0)
+     
+    def Dividend_Growth():
+        return morningstar.earnings_ratios.dps_growth.latest
+    
+    def Efficiency():
+        Capex_To_Assets= (cfs.capital_expenditure.latest * 4.) / \
+        bs.total_assets.latest
+        EBIT_To_Assets= (is_.ebit.latest * 4.) / bs.total_assets.latest
+        Operating_Cashflows_To_Assets= (cfs.operating_cash_flow.latest * 4.) /bs.total_assets.latest
+        Retained_Earnings_To_Assets= bs.retained_earnings.latest / \
+        bs.total_assets.latest
+        return Retained_Earnings_To_Assets.zscore(mask=universe)+\
+    Operating_Cashflows_To_Assets.zscore(mask=universe)+\
+    EBIT_To_Assets.zscore(mask=universe)+\
+    Capex_To_Assets.zscore(mask=universe)
+
+# Value            
+    def fcf_yield():
+        return vr.fcf_yield.latest
+
+    def earning_yield():
+        return vr.earning_yield.latest
+    
+    def freecf():
+        return cfs.free_cash_flow.latest/bs.total_equity.latest
+    
+    def PRICE():
+        return is_.ebit.latest/v.enterprise_value.latest
+
+# profitability
+    def profit():
+        GPOA = is_.gross_profit.latest/bs.total_assets.latest
+        roe = or_.roe.latest
+        roa = or_.roa.latest
+        CFOA = cfs.free_cash_flow.latest/bs.total_assets.latest
+        gmar = or_.gross_margin.latest
+        return GPOA.zscore(mask=universe) + roe.zscore(mask=universe) + roa.zscore(mask=universe)\
++ CFOA.zscore(mask=universe) + gmar.zscore(mask=universe)
+
+# Volatility   
+    class Vol_1M(CustomFactor):
+        inputs = [Returns(window_length=2)]
+        window_length = 20
+
+        def compute(self, today, assets, out, rets):
+            out[:] = -np.nanstd(rets, axis=0)
+            
+# Price ananomlies     
+    fq1_eps_cons = PeriodicConsensus.slice('EPS', 'af', 1)
+    fq2_eps_cons = PeriodicConsensus.slice('EPS', 'qf', 2)
+    fq1_eps_mean = fq1_eps_cons.mean.latest
+    fq2_eps_mean = fq2_eps_cons.mean.latest
+
+    class arm(CustomFactor):                             
+        window_length = 5
+        def compute(self, today, assets, out, latesteps):
+            from numpy import nanmin, nanmax
+            out[:] = (latesteps[len(latesteps)-1] - latesteps[0]) / (latesteps[len(latesteps)-1] + latesteps[0])
+
+    ae = arm([fq1_eps_cons.mean]);
+    
+    class High(CustomFactor):
+        window_length = 252 # ~52 weeks
+        inputs = [USEquityPricing.close]
+        def compute(self, today, asset_ids, out, close_prices):
+            out[:] = np.max(close_prices, axis=0)
+    
+    high = High()
+    
+    yesterday_close = USEquityPricing.close.latest
+# (Yesterday's close - 52 week high) / 52 week high
+    week52 = (yesterday_close - high) / high
+    
+
+# #  F_score construction below
+
+# profitbility
+    def FS_ROA():
+        roa = or_.roa.latest
+        return roa
+    
+    def FS_FCFTA():
+        fcfta = cfs.free_cash_flow.latest/bs.total_assets.latest
+        return fcfta
+    
+    def FS_ACCRUAL():
+        accrual = cfs.free_cash_flow.latest/bs.total_assets.latest-\
+        or_.roa.latest
+        return accrual 
+# stability
+    def FS_LEVER():
+        lever = Previous(inputs = [or_.debtto_assets], window_length = 252)
+        - or_.debtto_assets.latest
+        return lever
+
+    def FS_LIQUID():
+        return or_.current_ratio.latest - Previous(inputs = 
+                                                   [or_.current_ratio], 
+                                                   window_length = 252)
+
+    def FS_NEQISS():
+        return cfs.repurchase_of_capital_stock.latest-\
+    cfs.issuance_of_capital_stock.latest
+# Operational improvments
+    def ROA_growth():
+        return Returns(inputs=[or_.roa], window_length=252)
+
+    def FCFTA_growth():
+        nominator = cfs.free_cash_flow.latest/bs.total_assets.latest
+        denominator = Previous(inputs = [cfs.free_cash_flow], window_length\
+                               = 252)/Previous(inputs = [bs.total_assets], \
+                                               window_length = 252)
+        return (nominator-denominator)  / denominator
+
+    def Margin_growth():
+        return Returns(inputs = [or_.gross_margin], window_length = 252)
+
+    def Turn():
+        return Returns(inputs = [or_.assets_turnover], window_length = 252)
+    
+    all_factors = {\
+                   'Profitability':profit(),\
+                   'Efficiency':Efficiency(),\
+                   'Asset_Turnover':Asset_Turnover(),\
+                   # 'Asset Growth':Asset_Growth_5y(), \
+                   # 'Working_Capital_To_Sales':Working_Capital_To_Sales(),\
+                   'Volatility': Vol_1M(),\
+                   # 'Downside_Risk':Downside_Risk(),\
+                   'Asset_anomalies':asset_anomalies(),\
+                   'Debt_to_asset':Debt_to_asset(),\
+                   # 'Sales_Growth_12M':Sales_Growth_12M(),\
+                   # 'Dividend_Growth':Dividend_Growth(),\
+                   # 'growthscore':growthscore(),\
+                   # 'PEG':peg_ratio(),\
+                   # 'Capx_vol':Capx_vol(),\
+                   # 'Quick_Ratio':Quick_Ratio(),\
+                   'Cashflows_To_Assets':Cashflows_To_Assets(),\
+                   # 'GrossMarginChange':GrossMarginChange(),\
+                   'FREECF':freecf(),\
+                   'FCF yield': fcf_yield(),\
+                   'Earning yield':earning_yield(),\
+                   # 'MaxGap':MaxGap(),\
+                   # 'Trendline':Trendline(),\
+                   # 'MoneyflowVolume5d':MoneyflowVolume5d(),\
+                   # 'Direction':Direction(),\
+                   # 'MessageSum':MessageSum(),\
+                   # 'MACD_Signal_10d':MACD_Signal_10d(),\
+                   # 'Stochastic_Oscillator':Stochastic_Oscillator(),\
+                   # '52_week_high':week52,\
+                   'Altman_Z':Altman_Z(),\
+                   'Analyst revision':ae,\
+                   'Price':PRICE(), \
+                   'ROA':FS_ROA(), 'FCFTA':FS_FCFTA(), \
+                   'Accrual':FS_ACCRUAL(),'Leverage':FS_LEVER(), \
+                   'Liquidity':FS_LIQUID(), 'Net equity issuance':FS_NEQISS(),\
+                  'ROA_growth':ROA_growth(), 'FCFTA_growth':FCFTA_growth(), \
+                   'MArgin_growth':Margin_growth(),\
+                  'Tunrover improvements':Turn()\
+                  }
+    return all_factors, list(all_factors.keys())
+
+# Helper function to manipulate F_score calcualtion and rank with other alpha factors after exporting from pipline. Each component of F_score should be 1 if it is above 0 and 0 otherwise
+def F_score_plus_factors(results,keys):
+
+    columns = [ 'ROA', 'FCFTA', 'Accrual','Leverage', 'Liquidity', \
+               'Net equity issuance','ROA_growth', 'FCFTA_growth', \
+               'MArgin_growth','Tunrover improvements']
+    
+    df = [results[name].apply(filter_value)for name in columns]
+    new_df = pd.concat(df,axis =1).sum(axis=1)
+    fscore_df = pd.DataFrame(new_df, columns = ['Fscore'])
+    fscore_df['Fscore']= stats.zscore(fscore_df['Fscore'])
+    otfactor = []
+    for name in keys:
+        if name not in columns:
+            otfactor.append(results[name])
+            
+    return fscore_df.join(pd.concat(otfactor,axis = 1))
+    
+
+            
+def make_pipeline():
+    
+    base_universe = (QTradableStocksUS()  &Sector().notnull()&\
+                MarketCap().percentile_between(MIN_MARKET_CAP_PERCENTILE, MAX_MARKET_CAP_PERCENTILE)
+        & USEquityPricing.close.latest.notnull()        
+        & (USEquityPricing.volume.latest > 0))
+    
+    monthly_top_volume = (
+        AverageDollarVolume(window_length=LIQUIDITY_LOOKBACK_LENGTH)
+        .top(UNIVERSE_SIZE, mask=base_universe)
+        .downsample(BASE_UNIVERSE_RECALCULATE_FREQUENCY))
+    
+    universe = monthly_top_volume&base_universe
+    recent_returns = Returns(window_length=5)
+    factors, keys = make_factors(universe)
+    factor_ranks = {name: f.winsorize(min_percentile=0.01, max_percentile=0.99).zscore(mask=universe) for name, f in
+                    list(factors.items())}
+    
+    beta = 0.66*RollingLinearRegressionOfReturns(
+                    target=sid(8554),
+                    returns_length=5,
+                    regression_length=260,
+                    mask=universe
+                    ).beta + 0.33*1.0
+    
+    factor_ranks['sector']= Sector(mask=universe)
+    factor_ranks['Beta'] = beta    
+    pipe = Pipeline(screen=recent_returns.notnull() & Sector().notnull() \
+                    & universe, columns=factor_ranks)
+
+    return pipe
+
+        
+def initialize(context):
+    
+    
+    set_slippage(slippage.FixedBasisPointsSlippage(basis_points=5.0, volume_limit=1))
+    algo.attach_pipeline(make_pipeline(), 'pipeline')
+    
+    #Schedule Functions
+    schedule_function(trade, date_rules.week_start() , time_rules.market_open(minutes=10))
+    
+    context.relative_momentum_lookback = 126 #Momentum lookback
+    context.momentum_skip_days = 10
+    
+
+def before_trading_start(context, data):
+    
+    base_universe = (QTradableStocksUS()  &Sector().notnull()&\
+                MarketCap().percentile_between(MIN_MARKET_CAP_PERCENTILE, MAX_MARKET_CAP_PERCENTILE)
+        & USEquityPricing.close.latest.notnull()        
+        & (USEquityPricing.volume.latest > 0))
+    
+    monthly_top_volume = (
+        AverageDollarVolume(window_length=LIQUIDITY_LOOKBACK_LENGTH)
+        .top(UNIVERSE_SIZE, mask=base_universe)
+        .downsample(BASE_UNIVERSE_RECALCULATE_FREQUENCY))
+    universe = monthly_top_volume&base_universe
+    
+    context.output_pre = algo.pipeline_output('pipeline')
+    
+    _, keys = make_factors(universe)
+    context.output = F_score_plus_factors(context.output_pre,keys).dropna()
+    context.security_list = context.output.index
+    
+   
+    
+       
+def trade(context, data):
+
+    sector = context.output_pre.sector
+    risk_factor_exposures = pd.DataFrame({
+            'Beta':context.output_pre.Beta.fillna(1.0)
+        })
+    prices = data.history(context.security_list,"close", 252, "1d")
+    # prices_factor = data.history(context.small_list|context.big_list,"close", 252, "1d")
+    
+    
+    universe_size = len(context.security_list)
+    print(universe_size)
+    quality_size = int(universe_size*0.3)
+    momentum_size = int(quality_size*0.5)
+   
+    
+    df = context.output
+    
+#  first adjust volatility based on factor performance then
+#  weight by correlation,i.e. cosine similarity. 
+#  factor_mweighted adjust volalitty only
+#  comment out cosine_weighted to apply factor equal weighted 
+    f_weight, s_sum = factor_mweighted(df.columns,df,quality_size,prices)
+    for c in df.columns:
+        df[c]=df[c].apply(lambda x:x*f_weight[c]/s_sum)
+    try:    
+        f_weight_cos, s_sum_cos = cosine_weighted(df)
+        for c in df.columns:
+            df[c]=df[c].apply(lambda x:x*f_weight_cos[c]/s_sum_cos)
+    except:
+        pass
+    weighted_df = df.sum(axis=1)   
+     
+    top_n = weighted_df.nlargest(quality_size)
+    bottom_n = weighted_df.nsmallest(quality_size) 
+    quality_momentum = prices[top_n.index][:-context.momentum_skip_days].pct_change(context.relative_momentum_lookback).iloc[-1]
+    Non_quality_momentum = prices[bottom_n.index][:-context.momentum_skip_days].pct_change(context.relative_momentum_lookback).iloc[-1]
+#     #long stocks with best momentum    
+    top_n_by_momentum = quality_momentum.nlargest(momentum_size)
+#     short worst scored stocks with worset momentum
+    bottom_n_by_momentum = Non_quality_momentum.nsmallest(momentum_size)
+#     calculate annualized realized volatility
+    momentum_vol = np.sqrt(np.sum(\
+                          np.mean(prices[top_n_by_momentum.index].pct_change()[-126:],axis=1)**2)*2)
+#     if the top momentum portfolio has annualized volatility higher than the threshold, switch momentum to contrarian
+    if momentum_vol > 0.27:
+        top_n_by_momentum_f = quality_momentum.nsmallest(momentum_size)
+        bottom_n_by_momentum_f = Non_quality_momentum.nlargest(momentum_size)
+        print('Exceed threshold')
+    else:
+        top_n_by_momentum_f = top_n_by_momentum
+        bottom_n_by_momentum_f = bottom_n_by_momentum
+    
+    context.long_set = set(top_n_by_momentum_f.index)
+    context.short_set = set(bottom_n_by_momentum_f.index)
+    
+    context.security_set = set(context.long_set.union(context.short_set))
+    print('Portfolio', len(context.security_set))
+   
+
+# Optimize portfolio weights
+    x = weighted_df.loc[context.security_set]
+    x = x.fillna(0)
+    x[~np.isfinite(x)] = 0
+    objective = opt.MaximizeAlpha(x)
+    constrain_gross_leverage = opt.MaxGrossExposure(1)
+    # constrain_netexposure = opt.NetExposure(0.0, 1.0)
+    constrain_pos_size = \
+    opt.PositionConcentration.with_equal_bounds(-POSITION_SIZE,POSITION_SIZE)
+                                                                           
+    
+    market_neutral = opt.DollarNeutral()
+    neutralize_risk_factors = opt.FactorExposure(
+        loadings=risk_factor_exposures,
+        min_exposures={'Beta':-MAX_BETA_EXPOSURE},
+        max_exposures={'Beta':MAX_BETA_EXPOSURE}
+        )
+    sector_neutral = opt.NetGroupExposure.with_equal_bounds(
+        labels=sector,
+        min=-0.005,
+        max=0.005,
+    ) 
+    # weights = opt.calculate_optimal_portfolio(objective, constraints=[constrain_gross_leverage, constrain_netexposure, constrain_pos_size,market_neutral])
+    algo.order_optimal_portfolio(        
+        objective = objective,
+        constraints=[
+           neutralize_risk_factors,
+           constrain_gross_leverage,
+           constrain_pos_size,
+           market_neutral,
+           sector_neutral,
+        ]
+        
+    )
+
+    
+
+# the function that applies volatility timing then weight factors accordingly
+
+def factor_mweighted(factors,output,counts,prices_1M):
+    f_weight ={}
+    for f in factors:
+       top = output[f].nlargest(counts)
+       bottom = output[f].nsmallest(counts)
+       mean = np.nanmean(prices_1M[top.index].pct_change(20).iloc[-1])-\
+    np.nanmean(prices_1M[bottom.index].pct_change(20).iloc[-1])
+       sigma = np.std(np.mean(prices_1M[top.index].pct_change(20),axis = 1)\
+                      - np.mean(prices_1M[bottom.index].pct_change(20),axis = 1))
+
+       # sigma = np.sqrt(np.sum((np.mean(prices_1M[top.index].pct_change()[-126:],axis =1) - np.mean(prices_1M[bottom.index].pct_change()[-126:],axis = 1))**2)*2)
+       # sigma = np.sqrt(np.sum((np.mean(prices_1M[top.index].pct_change()[--20:],axis =1) - np.mean(prices_1M[bottom.index].pct_change()[-20:],axis = 1))**2))
+       
+       t = mean/sigma
+       P_value = stats.norm.sf(np.abs(t)) * 2
+   
+       if f=='Volatility' and mean >0 and P_value <=0.05:
+        print ('high Vol regime')
+        s = -1
+        # s = min(max(mean/sigma, -2),2)
+       else:
+        s = 1
+       
+       
+       f_weight[f] = s
+    print (f_weight)
+    # print ('Vo:', sigma*np.sqrt(12))
+    return f_weight, np.sum(list(f_weight.values()))
+
+# the function that applies factor correlation weighting
+def cosine_weighted(output):
+    alpha_weighted = {}
+    sum_weight = []
+    for alpha, A in output.iteritems():  
+        w = 0  
+        for alpha1, B in output.iteritems():  
+            # w += np.abs(A.dot(B)/np.linalg.norm(A)/np.linalg.norm(B)) 
+            w += cosine_similarity(A,B)[0][0]
+        sum_weight.append(w)
+        alpha_weighted[alpha] = 1.0/w  
+    return alpha_weighted, np.sum(sum_weight)
